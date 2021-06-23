@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from typing import Union, cast
 from uuid import uuid4
 
 from ee.clickhouse.client import sync_execute
@@ -13,9 +14,26 @@ from posthog.test.base import APIBaseTest
 
 FORMAT_TIME = "%Y-%m-%d 00:00:00"
 
+TIME_0 = "2021-06-03 13:42:00"
+TIME_1 = "2021-06-07 00:00:00"
+TIME_3 = "2021-06-07 19:00:00"
+TIME_4 = "2021-06-08 02:00:00"
+TIME_99 = "2021-06-13 23:59:59"
 
-def build_funnel_trend_v2_query(team_id: int, start: datetime, event_1: str, event_2: str, event_3: str) -> str:
-    JOIN_DISTINCT_ID_SNIPPET = f"""
+STEP_1_EVENT = "step one"
+STEP_2_EVENT = "step two"
+STEP_3_EVENT = "step three"
+USER_A_DISTINCT_ID = "user a"
+
+
+def build_funnel_trend_v2_query(
+    team_id: int, start: Union[str, datetime], end: Union[str, datetime], event_1: str, event_2: str, event_3: str
+) -> str:
+    start_string: str = start if isinstance(start, str) else start.strftime(FORMAT_TIME)
+    end_string: str = end if isinstance(end, str) else end.strftime(FORMAT_TIME)
+
+    join_distinct_id_part = f"""
+    -- join distinct_id
     JOIN (
         SELECT person_id, distinct_id
         FROM (
@@ -36,7 +54,8 @@ def build_funnel_trend_v2_query(team_id: int, start: datetime, event_1: str, eve
     ON pid.distinct_id = events.distinct_id
     """
 
-    FUNNEL_STEPS_QUERY_3_STEPS = f"""
+    funnel_steps_query_part_3_steps = f"""
+    -- calculate funnel steps
     SELECT day, countIf(furthest = 1) one_step, countIf(furthest = 2) two_step, countIf(furthest=3) three_step FROM (
         SELECT person_id, toStartOfDay(time_of_event) day, max(steps) AS furthest FROM (
             SELECT *,
@@ -81,10 +100,10 @@ def build_funnel_trend_v2_query(team_id: int, start: datetime, event_1: str, eve
                             if(step_3 = 1, timestamp, null) AS latest_3,
                             if(step_1 = 1 OR step_2 = 1 OR step_3 = 1, timestamp, null) AS time_of_event
                             FROM events
-                            {JOIN_DISTINCT_ID_SNIPPET}
-                            WHERE team_id = 2
-                            AND events.timestamp >= '2021-05-16 00:00:00'
-                            AND events.timestamp <= '2021-05-23 23:59:59'
+                            {join_distinct_id_part}
+                            WHERE team_id = {team_id}
+                            AND events.timestamp >= '{start_string}'
+                            AND events.timestamp <= '{end_string}'
                             AND isNotNull(time_of_event)
                             ORDER BY time_of_event ASC
                         )
@@ -96,12 +115,13 @@ def build_funnel_trend_v2_query(team_id: int, start: datetime, event_1: str, eve
     ) GROUP BY day
     """
 
-    FUNNEL_TRENDS_QUERY_3_STEPS = f"""
-    SELECT toStartOfDay(toDateTime('{start.strftime(FORMAT_TIME)}') - number * 86400) AS day, total, completed, percentage
+    funnel_trends_query_complete_3_steps = f"""
+    -- calculate funnel trends using steps
+    SELECT toStartOfDay(toDateTime('{start_string}') - number * 86400) AS day, total, completed, percentage
     FROM numbers(8) AS num
     LEFT OUTER JOIN (
         SELECT day, one_step + three_step AS total, three_step AS completed, completed / total AS percentage FROM (
-            {FUNNEL_STEPS_QUERY_3_STEPS}
+            {funnel_steps_query_part_3_steps}
         )
     ) data
     ON data.day = day 
@@ -109,7 +129,7 @@ def build_funnel_trend_v2_query(team_id: int, start: datetime, event_1: str, eve
     SETTINGS allow_experimental_window_functions = 1
     """
 
-    return FUNNEL_TRENDS_QUERY_3_STEPS
+    return funnel_trends_query_complete_3_steps
 
 
 def _create_person(**kwargs):
@@ -123,9 +143,46 @@ def _create_event(**kwargs):
 
 
 class TestFunnelTrends(ClickhouseTestMixin, APIBaseTest):
-    def test_all_results_for_day_interval(self):
-        time_1 = datetime.fromisoformat("2020-06-13T12:00")
-        sql = build_funnel_trend_v2_query(self.team.pk, time_1, "step 1", "step 2", "step 3")
-        print(sql)
+    maxDiff = None
+
+    def test_no_event_in_period(self):
+        _create_person(distinct_ids=[USER_A_DISTINCT_ID], team=self.team)
+
+        _create_event(event=STEP_1_EVENT, distinct_id=USER_A_DISTINCT_ID, team=self.team, timestamp=TIME_0)
+
+        sql = build_funnel_trend_v2_query(self.team.pk, TIME_1, TIME_99, STEP_1_EVENT, STEP_2_EVENT, STEP_3_EVENT)
         results = sync_execute(sql)
-        print(results)
+        self.assertListEqual(
+            cast(list, results),
+            [
+                (datetime(2021, 5, 31, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 1, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 2, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 3, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 4, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 5, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 6, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 7, 0, 0), 0, 0, 0.0),
+            ],
+        )
+
+    def test_only_one_user_reached_one_step(self):
+        _create_person(distinct_ids=[USER_A_DISTINCT_ID], team=self.team)
+
+        _create_event(event=STEP_1_EVENT, distinct_id=USER_A_DISTINCT_ID, team=self.team, timestamp=TIME_3)
+
+        sql = build_funnel_trend_v2_query(self.team.pk, TIME_1, TIME_99, STEP_1_EVENT, STEP_2_EVENT, STEP_3_EVENT)
+        results = sync_execute(sql)
+        self.assertListEqual(
+            cast(list, results),
+            [
+                (datetime(2021, 5, 31, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 1, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 2, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 3, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 4, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 5, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 6, 0, 0), 0, 0, 0.0),
+                (datetime(2021, 6, 7, 0, 0), 1, 0, 0.0),
+            ],
+        )
